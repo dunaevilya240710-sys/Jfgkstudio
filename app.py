@@ -1,7 +1,8 @@
 import os
-import secrets
 import sqlite3
+import uuid
 from functools import wraps
+from datetime import datetime
 
 from flask import (
     Flask,
@@ -9,28 +10,29 @@ from flask import (
     redirect,
     url_for,
     session,
-    render_template_string,
     flash,
-    abort,
+    render_template_string,
+    send_from_directory,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
-
 app = Flask(__name__)
 
-app.secret_key = os.environ.get("JFGK_SECRET_KEY") or secrets.token_hex(32)
+app.secret_key = os.environ.get(
+    "JFGK_SECRET_KEY",
+    "jfgk-development-secret-change-me"
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "site.db")
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
-ALLOWED_EXTENSIONS = {
+ALLOWED_IMAGE_EXTENSIONS = {
     "png",
     "jpg",
     "jpeg",
@@ -38,117 +40,90 @@ ALLOWED_EXTENSIONS = {
     "webp",
 }
 
+DATABASE = os.path.join(BASE_DIR, "jfgk.db")
+
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    db = sqlite3.connect(DATABASE)
+    db.row_factory = sqlite3.Row
+    return db
 
 
 def init_db():
-    conn = get_db()
+    db = get_db()
 
-    conn.execute(
+    db.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            email TEXT,
             account_type TEXT NOT NULL DEFAULT 'client',
-            avatar TEXT,
-            bio TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
+            display_name TEXT NOT NULL,
+            bio TEXT DEFAULT '',
+            avatar TEXT DEFAULT '',
+            service_category TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
 
-    conn.execute(
-        """
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            image TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
+            content TEXT NOT NULL,
+            image TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
 
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS services (
+        CREATE TABLE IF NOT EXISTS likes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            price TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
+            post_id INTEGER NOT NULL,
+            UNIQUE(user_id, post_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
+        );
 
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS orders (
+        CREATE TABLE IF NOT EXISTS follows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id INTEGER NOT NULL,
+            follower_id INTEGER NOT NULL,
             provider_id INTEGER NOT NULL,
-            service_id INTEGER NOT NULL,
-            description TEXT,
-            status TEXT DEFAULT 'Новая',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(client_id) REFERENCES users(id),
-            FOREIGN KEY(provider_id) REFERENCES users(id),
-            FOREIGN KEY(service_id) REFERENCES services(id)
-        )
-        """
-    )
+            UNIQUE(follower_id, provider_id),
+            FOREIGN KEY(follower_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(provider_id) REFERENCES users(id) ON DELETE CASCADE
+        );
 
-    conn.execute(
-        """
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender_id INTEGER NOT NULL,
             receiver_id INTEGER NOT NULL,
             text TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(sender_id) REFERENCES users(id),
-            FOREIGN KEY(receiver_id) REFERENCES users(id)
-        )
+            created_at TEXT NOT NULL,
+            is_read INTEGER DEFAULT 0,
+            FOREIGN KEY(sender_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(receiver_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS donations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            donor_id INTEGER NOT NULL,
+            receiver_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            message TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(donor_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(receiver_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         """
     )
 
-    conn.commit()
-
-    # Безопасное обновление старой базы, если она уже существовала.
-    columns = {
-        row["name"]
-        for row in conn.execute("PRAGMA table_info(users)").fetchall()
-    }
-
-    if "account_type" not in columns:
-        conn.execute(
-            """
-            ALTER TABLE users
-            ADD COLUMN account_type TEXT NOT NULL DEFAULT 'client'
-            """
-        )
-
-    conn.commit()
-    conn.close()
+    db.commit()
+    db.close()
 
 
 init_db()
-
-
-def allowed_file(filename):
-    return (
-        "." in filename
-        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-    )
 
 
 def current_user():
@@ -157,75 +132,69 @@ def current_user():
     if not user_id:
         return None
 
-    conn = get_db()
-
-    user = conn.execute(
+    db = get_db()
+    user = db.execute(
         "SELECT * FROM users WHERE id = ?",
         (user_id,),
     ).fetchone()
-
-    conn.close()
+    db.close()
 
     return user
 
 
-def login_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if not session.get("user_id"):
-            flash("Сначала войдите в аккаунт.")
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            flash("Сначала войдите в аккаунт.", "error")
             return redirect(url_for("login"))
 
-        return func(*args, **kwargs)
+        return view(*args, **kwargs)
 
-    return wrapper
-
-
-def provider_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        user = current_user()
-
-        if not user:
-            return redirect(url_for("login"))
-
-        if user["account_type"] != "provider":
-            flash("Эта функция доступна только исполнителям.")
-            return redirect(url_for("feed"))
-
-        return func(*args, **kwargs)
-
-    return wrapper
+    return wrapped
 
 
-def client_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        user = current_user()
+def allowed_image(filename):
+    if not filename or "." not in filename:
+        return False
 
-        if not user:
-            return redirect(url_for("login"))
-
-        if user["account_type"] != "client":
-            flash("Эта функция доступна клиентам.")
-            return redirect(url_for("feed"))
-
-        return func(*args, **kwargs)
-
-    return wrapper
+    extension = filename.rsplit(".", 1)[1].lower()
+    return extension in ALLOWED_IMAGE_EXTENSIONS
 
 
-BASE_TEMPLATE = """
-<!DOCTYPE html>
+def save_image(file):
+    if not file or not file.filename:
+        return ""
+
+    if not allowed_image(file.filename):
+        return ""
+
+    extension = file.filename.rsplit(".", 1)[1].lower()
+    filename = f"{uuid.uuid4().hex}.{extension}"
+
+    file.save(
+        os.path.join(
+            app.config["UPLOAD_FOLDER"],
+            filename,
+        )
+    )
+
+    return filename
+
+
+def now():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+BASE_HTML = """
+<!doctype html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-
     <meta
         name="viewport"
         content="width=device-width, initial-scale=1.0"
     >
-
     <title>{{ title }} — JFGK Studio</title>
 
     <style>
@@ -235,22 +204,14 @@ BASE_TEMPLATE = """
 
         body {
             margin: 0;
+            background: #0b0f14;
+            color: #f4f6f8;
             font-family:
                 Inter,
-                Arial,
-                Helvetica,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
                 sans-serif;
-
-            background:
-                radial-gradient(
-                    circle at top,
-                    #202838 0%,
-                    #0b0e13 45%,
-                    #07090d 100%
-                );
-
-            color: #ffffff;
-            min-height: 100vh;
         }
 
         a {
@@ -258,342 +219,464 @@ BASE_TEMPLATE = """
             text-decoration: none;
         }
 
-        .nav {
+        button,
+        input,
+        textarea,
+        select {
+            font: inherit;
+        }
+
+        .topbar {
             position: sticky;
             top: 0;
-            z-index: 100;
+            z-index: 20;
+            background: rgba(11, 15, 20, .95);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid #202731;
+        }
 
-            background: rgba(10, 13, 18, 0.92);
-            backdrop-filter: blur(16px);
-
-            border-bottom: 1px solid #242a35;
-
-            padding: 15px 5%;
-
+        .nav {
+            max-width: 1050px;
+            margin: auto;
+            min-height: 64px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-
+            padding: 0 18px;
             gap: 20px;
         }
 
         .logo {
-            font-size: 24px;
+            font-size: 22px;
             font-weight: 900;
-            letter-spacing: -1px;
+            letter-spacing: -.8px;
         }
 
         .logo span {
-            color: #8da8ff;
+            color: #7c5cff;
         }
 
         .nav-links {
             display: flex;
             align-items: center;
             gap: 8px;
-            flex-wrap: wrap;
+            overflow-x: auto;
         }
 
         .nav-links a {
             padding: 9px 12px;
-            border-radius: 9px;
-            color: #b9c0cc;
+            border-radius: 10px;
+            color: #b9c0ca;
+            white-space: nowrap;
             font-size: 14px;
         }
 
         .nav-links a:hover {
-            background: #191e27;
-            color: #ffffff;
+            background: #171d25;
+            color: white;
         }
 
         .container {
-            width: min(1100px, 92%);
-            margin: 35px auto 70px;
-        }
-
-        .hero {
-            padding: 70px 25px;
-            text-align: center;
-
-            border: 1px solid #293140;
-            border-radius: 24px;
-
-            background:
-                linear-gradient(
-                    135deg,
-                    rgba(38, 47, 65, 0.9),
-                    rgba(17, 21, 29, 0.95)
-                );
-
-            box-shadow: 0 25px 80px rgba(0, 0, 0, 0.25);
-        }
-
-        .hero h1 {
-            font-size: clamp(42px, 8vw, 76px);
-            margin: 0;
-            letter-spacing: -4px;
-        }
-
-        .hero p {
-            max-width: 650px;
-            margin: 22px auto;
-            line-height: 1.7;
-            color: #aeb7c7;
-        }
-
-        h1 {
-            letter-spacing: -1.5px;
-        }
-
-        h2,
-        h3 {
-            letter-spacing: -0.5px;
-        }
-
-        .muted {
-            color: #9da7b7;
+            width: min(1050px, calc(100% - 28px));
+            margin: 28px auto 80px;
         }
 
         .grid {
             display: grid;
-            grid-template-columns:
-                repeat(auto-fit, minmax(250px, 1fr));
-
-            gap: 18px;
-        }
-
-        .card {
-            background: rgba(20, 24, 32, 0.9);
-
-            border: 1px solid #29303c;
-            border-radius: 18px;
-
-            padding: 22px;
-
-            box-shadow:
-                0 12px 40px rgba(0, 0, 0, 0.15);
-        }
-
-        .btn {
-            display: inline-block;
-
-            border: 0;
-            cursor: pointer;
-
-            padding: 11px 17px;
-
-            border-radius: 10px;
-
-            background: #ffffff;
-            color: #11151c;
-
-            font-weight: 800;
-
-            transition: 0.2s;
-        }
-
-        .btn:hover {
-            transform: translateY(-1px);
-            opacity: 0.9;
-        }
-
-        .btn-dark {
-            background: #252c38;
-            color: #ffffff;
-        }
-
-        .btn-blue {
-            background: #657eff;
-            color: #ffffff;
-        }
-
-        .btn-red {
-            background: #612d36;
-            color: #ffffff;
-        }
-
-        form {
-            margin: 0;
-        }
-
-        label {
-            display: block;
-            margin: 14px 0 7px;
-
-            color: #d9dee7;
-            font-weight: 700;
-        }
-
-        input,
-        textarea,
-        select {
-            width: 100%;
-
-            border: 1px solid #333b49;
-            border-radius: 10px;
-
-            background: #0d1016;
-            color: #ffffff;
-
-            padding: 13px;
-
-            outline: none;
-        }
-
-        input:focus,
-        textarea:focus,
-        select:focus {
-            border-color: #657eff;
-        }
-
-        textarea {
-            min-height: 130px;
-            resize: vertical;
-        }
-
-        .alert {
-            padding: 13px 16px;
-            margin-bottom: 15px;
-
-            border-radius: 11px;
-
-            background: #3c252b;
-            border: 1px solid #68404a;
-        }
-
-        .post {
-            overflow: hidden;
-            padding: 0;
-        }
-
-        .post-body {
-            padding: 20px;
-        }
-
-        .post-header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 15px;
-        }
-
-        .avatar {
-            width: 48px;
-            height: 48px;
-
-            border-radius: 50%;
-            object-fit: cover;
-
-            background: #272e39;
-
-            border: 1px solid #394250;
-        }
-
-        .avatar-large {
-            width: 100px;
-            height: 100px;
-        }
-
-        .avatar-placeholder {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-
-            font-weight: 900;
-            color: #dbe2ef;
-        }
-
-        .post-image {
-            display: block;
-
-            width: 100%;
-            max-height: 600px;
-
-            object-fit: cover;
-        }
-
-        .post-text {
-            white-space: pre-wrap;
-            line-height: 1.65;
-            color: #e4e8ef;
-        }
-
-        .badge {
-            display: inline-block;
-
-            padding: 5px 9px;
-
-            border-radius: 999px;
-
-            background: #242c3a;
-            color: #b9c8ff;
-
-            font-size: 12px;
-            font-weight: 700;
-        }
-
-        .feed {
-            max-width: 720px;
-            margin: 0 auto;
-        }
-
-        .two-column {
-            display: grid;
-            grid-template-columns: 2fr 1fr;
+            grid-template-columns: minmax(0, 1fr) 310px;
             gap: 22px;
         }
 
-        .service-price {
-            font-size: 20px;
-            font-weight: 900;
-            margin: 15px 0;
+        .card {
+            background: #111720;
+            border: 1px solid #202936;
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 16px;
         }
 
-        .profile-top {
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            flex-wrap: wrap;
+        .hero {
+            padding: 28px;
+            border-radius: 22px;
+            background:
+                radial-gradient(
+                    circle at top right,
+                    rgba(124,92,255,.3),
+                    transparent 45%
+                ),
+                #111720;
+            border: 1px solid #252e3b;
+            margin-bottom: 20px;
         }
 
-        .user-row {
-            display: flex;
-            align-items: center;
-            gap: 12px;
+        h1,
+        h2,
+        h3 {
+            margin-top: 0;
         }
 
-        .empty {
-            text-align: center;
-            padding: 45px 20px;
-            color: #858e9d;
+        h1 {
+            font-size: 34px;
+            letter-spacing: -1.2px;
         }
 
-        footer {
-            text-align: center;
-            padding: 35px;
-            color: #667080;
+        h2 {
+            font-size: 24px;
+        }
+
+        .muted {
+            color: #8993a1;
         }
 
         .small {
             font-size: 13px;
         }
 
-        @media (max-width: 760px) {
-            .nav {
-                align-items: flex-start;
-                flex-direction: column;
-            }
+        .btn {
+            display: inline-flex;
+            justify-content: center;
+            align-items: center;
+            border: 0;
+            border-radius: 11px;
+            padding: 10px 15px;
+            background: #7c5cff;
+            color: white;
+            cursor: pointer;
+            font-weight: 700;
+        }
 
-            .two-column {
+        .btn:hover {
+            background: #6e4ef0;
+        }
+
+        .btn.secondary {
+            background: #202936;
+        }
+
+        .btn.danger {
+            background: #b9384b;
+        }
+
+        .btn.green {
+            background: #238b67;
+        }
+
+        .btn.full {
+            width: 100%;
+        }
+
+        form {
+            margin: 0;
+        }
+
+        input,
+        textarea,
+        select {
+            width: 100%;
+            background: #0c1118;
+            border: 1px solid #293341;
+            border-radius: 11px;
+            color: white;
+            padding: 12px 13px;
+            outline: none;
+            margin-top: 6px;
+            margin-bottom: 14px;
+        }
+
+        input:focus,
+        textarea:focus,
+        select:focus {
+            border-color: #7c5cff;
+        }
+
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+
+        label {
+            color: #aeb7c3;
+            font-size: 14px;
+        }
+
+        .post-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 13px;
+        }
+
+        .avatar {
+            width: 46px;
+            height: 46px;
+            border-radius: 50%;
+            object-fit: cover;
+            background: #252e3b;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 800;
+            flex-shrink: 0;
+        }
+
+        .avatar.large {
+            width: 100px;
+            height: 100px;
+            font-size: 30px;
+        }
+
+        .avatar.xlarge {
+            width: 130px;
+            height: 130px;
+            font-size: 38px;
+        }
+
+        .post-image {
+            width: 100%;
+            max-height: 600px;
+            object-fit: cover;
+            border-radius: 14px;
+            margin-top: 10px;
+        }
+
+        .post-content {
+            white-space: pre-wrap;
+            line-height: 1.6;
+            color: #e7ebef;
+        }
+
+        .post-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 15px;
+        }
+
+        .icon-btn {
+            border: 0;
+            background: #1a212b;
+            color: #cbd2db;
+            border-radius: 10px;
+            padding: 9px 12px;
+            cursor: pointer;
+        }
+
+        .icon-btn:hover {
+            background: #252e3b;
+        }
+
+        .liked {
+            color: #ff6179;
+        }
+
+        .profile-top {
+            display: flex;
+            gap: 22px;
+            align-items: center;
+        }
+
+        .profile-info {
+            flex: 1;
+        }
+
+        .profile-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 15px;
+        }
+
+        .tag {
+            display: inline-block;
+            padding: 5px 9px;
+            border-radius: 999px;
+            background: #25203d;
+            color: #bcaeff;
+            font-size: 12px;
+        }
+
+        .user-row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid #202731;
+        }
+
+        .user-row:last-child {
+            border-bottom: 0;
+        }
+
+        .user-row .grow {
+            flex: 1;
+        }
+
+        .flash {
+            padding: 12px 14px;
+            background: #18202a;
+            border: 1px solid #293341;
+            border-radius: 12px;
+            margin-bottom: 14px;
+        }
+
+        .flash.error {
+            border-color: #8c3343;
+            background: #321821;
+        }
+
+        .flash.success {
+            border-color: #27775d;
+            background: #142a23;
+        }
+
+        .chat-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .chat-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 13px;
+            border-radius: 13px;
+            background: #171e27;
+        }
+
+        .chat-item:hover {
+            background: #202936;
+        }
+
+        .messages {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-height: 350px;
+            max-height: 600px;
+            overflow-y: auto;
+            padding: 10px 0;
+        }
+
+        .message {
+            max-width: 75%;
+            padding: 10px 13px;
+            border-radius: 14px;
+            background: #202936;
+            align-self: flex-start;
+        }
+
+        .message.mine {
+            background: #6247cf;
+            align-self: flex-end;
+        }
+
+        .message-time {
+            display: block;
+            opacity: .65;
+            font-size: 10px;
+            margin-top: 4px;
+        }
+
+        .stats {
+            display: flex;
+            gap: 20px;
+            margin-top: 15px;
+        }
+
+        .stat strong {
+            display: block;
+            font-size: 20px;
+        }
+
+        .empty {
+            padding: 45px 20px;
+            text-align: center;
+            color: #7f8996;
+        }
+
+        .two {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .donate-box {
+            text-align: center;
+            padding: 25px;
+        }
+
+        .amounts {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+
+        .amounts button {
+            border: 1px solid #303a48;
+            background: #171e27;
+            color: white;
+            padding: 10px;
+            border-radius: 10px;
+            cursor: pointer;
+        }
+
+        .amounts button:hover {
+            border-color: #7c5cff;
+        }
+
+        @media (max-width: 800px) {
+            .grid {
                 grid-template-columns: 1fr;
             }
 
-            .hero {
-                padding: 50px 20px;
+            .profile-top {
+                align-items: flex-start;
             }
 
-            .hero h1 {
-                letter-spacing: -2px;
+            .nav {
+                align-items: flex-start;
+                flex-direction: column;
+                padding: 12px 14px;
+                gap: 8px;
+            }
+
+            .nav-links {
+                width: 100%;
+            }
+        }
+
+        @media (max-width: 500px) {
+            .container {
+                width: min(100% - 18px, 1050px);
+                margin-top: 18px;
+            }
+
+            .card {
+                border-radius: 14px;
+                padding: 14px;
+            }
+
+            .hero {
+                padding: 20px;
+            }
+
+            h1 {
+                font-size: 28px;
+            }
+
+            .profile-top {
+                flex-direction: column;
+            }
+
+            .two {
+                grid-template-columns: 1fr;
+            }
+
+            .amounts {
+                grid-template-columns: repeat(2, 1fr);
             }
         }
     </style>
@@ -601,1632 +684,1365 @@ BASE_TEMPLATE = """
 
 <body>
 
-<nav class="nav">
-
-    <a class="logo" href="{{ url_for('index') }}">
-        JFGK <span>Studio</span>
-    </a>
-
-    <div class="nav-links">
-
-        <a href="{{ url_for('feed') }}">
-            Лента
+<header class="topbar">
+    <nav class="nav">
+        <a class="logo" href="{{ url_for('feed') }}">
+            JFGK<span>Studio</span>
         </a>
 
-        <a href="{{ url_for('services') }}">
-            Услуги
-        </a>
-
-        {% if session.get("user_id") %}
-
-            <a href="{{ url_for('profile') }}">
-                Профиль
-            </a>
-
-            <a href="{{ url_for('orders') }}">
-                Заявки
-            </a>
-
-            <a href="{{ url_for('messages') }}">
-                Сообщения
-            </a>
-
-            <a href="{{ url_for('logout') }}">
-                Выйти
-            </a>
-
-        {% else %}
-
-            <a href="{{ url_for('login') }}">
-                Войти
-            </a>
-
-            <a class="btn btn-blue" href="{{ url_for('register') }}">
-                Регистрация
-            </a>
-
-        {% endif %}
-
-    </div>
-
-</nav>
+        <div class="nav-links">
+            {% if user %}
+                <a href="{{ url_for('feed') }}">Лента</a>
+                <a href="{{ url_for('explore') }}">Специалисты</a>
+                <a href="{{ url_for('chats') }}">Чаты</a>
+                <a href="{{ url_for('new_post') }}">+ Пост</a>
+                <a href="{{ url_for('profile', username=user['username']) }}">
+                    Профиль
+                </a>
+                <a href="{{ url_for('logout') }}">Выйти</a>
+            {% else %}
+                <a href="{{ url_for('login') }}">Войти</a>
+                <a href="{{ url_for('register') }}">Регистрация</a>
+            {% endif %}
+        </div>
+    </nav>
+</header>
 
 <main class="container">
 
-    {% with messages = get_flashed_messages() %}
-
-        {% if messages %}
-
-            {% for message in messages %}
-
-                <div class="alert">
-                    {{ message }}
-                </div>
-
-            {% endfor %}
-
-        {% endif %}
-
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="flash {{ category }}">
+                {{ message }}
+            </div>
+        {% endfor %}
     {% endwith %}
 
-    {{ content|safe }}
+    {{ body|safe }}
 
 </main>
-
-<footer>
-    JFGK Studio · Платформа для клиентов и специалистов
-</footer>
 
 </body>
 </html>
 """
 
 
-def page(title, content):
-    return render_template_string(
-        BASE_TEMPLATE,
+def page(title, body, **context):
+    user = current_user()
+
+    html = render_template_string(
+        BASE_HTML,
         title=title,
-        content=content,
+        body=body,
+        user=user,
+        **context
     )
 
-
-def avatar_html(user, large=False):
-    size_class = "avatar-large" if large else ""
-
-    if user["avatar"]:
-        return f"""
-        <img
-            class="avatar {size_class}"
-            src="{url_for('uploaded_file', filename=user['avatar'])}"
-            alt="Аватар"
-        >
-        """
-
-    letter = user["username"][0].upper()
-
-    return f"""
-    <div class="avatar avatar-placeholder {size_class}">
-        {letter}
-    </div>
-    """
+    return html
 
 
 @app.route("/")
-def index():
-    content = """
-    <section class="hero">
-
-        <h1>JFGK Studio</h1>
-
-        <p>
-            Платформа, где клиенты находят специалистов,
-            а специалисты показывают свои работы и услуги.
-        </p>
-
-        <div>
-            <a class="btn btn-blue" href="/feed">
-                Открыть ленту
-            </a>
-
-            <a class="btn btn-dark" href="/register">
-                Создать аккаунт
-            </a>
-        </div>
-
-    </section>
-
-    <br>
-
-    <div class="grid">
-
-        <div class="card">
-            <h2>Для клиентов</h2>
-            <p class="muted">
-                Находите специалистов, смотрите публикации,
-                выбирайте услуги и отправляйте заявки.
-            </p>
-        </div>
-
-        <div class="card">
-            <h2>Для специалистов</h2>
-            <p class="muted">
-                Создавайте профиль, публикуйте работы,
-                добавляйте услуги и получайте заявки.
-            </p>
-        </div>
-
-        <div class="card">
-            <h2>Общая лента</h2>
-            <p class="muted">
-                Делитесь фотографиями, текстами и своими проектами.
-            </p>
-        </div>
-
-    </div>
-    """
-
-    return page("Главная", content)
-
-
-@app.route("/feed")
 def feed():
-    conn = get_db()
+    db = get_db()
 
-    posts = conn.execute(
+    posts = db.execute(
         """
         SELECT
             posts.*,
             users.username,
+            users.display_name,
+            users.avatar,
             users.account_type,
-            users.avatar
+            (
+                SELECT COUNT(*)
+                FROM likes
+                WHERE likes.post_id = posts.id
+            ) AS likes_count,
+            (
+                SELECT COUNT(*)
+                FROM likes
+                WHERE likes.post_id = posts.id
+                AND likes.user_id = ?
+            ) AS liked
         FROM posts
         JOIN users ON users.id = posts.user_id
-        ORDER BY posts.created_at DESC
-        """
+        ORDER BY posts.id DESC
+        """,
+        (session.get("user_id", 0),),
     ).fetchall()
 
-    conn.close()
+    db.close()
 
-    create_form = ""
-
-    if session.get("user_id"):
-        create_form = """
-        <div class="card">
-
-            <h2>Создать публикацию</h2>
-
-            <form
-                method="post"
-                action="/post/create"
-                enctype="multipart/form-data"
-            >
-
-                <label>Текст</label>
-
-                <textarea
-                    name="text"
-                    placeholder="Что хотите рассказать?"
-                    required
-                ></textarea>
-
-                <label>Фото</label>
-
-                <input
-                    type="file"
-                    name="image"
-                    accept="image/*"
-                >
-
-                <br><br>
-
-                <button class="btn btn-blue" type="submit">
-                    Опубликовать
-                </button>
-
-            </form>
-
-        </div>
-
-        <br>
-        """
-
-    posts_html = ""
-
-    for post in posts:
-
-        type_name = (
-            "Предоставляющий услугу"
-            if post["account_type"] == "provider"
-            else "Клиент"
-        )
-
-        image_html = ""
-
-        if post["image"]:
-            image_html = f"""
-            <img
-                class="post-image"
-                src="{url_for('uploaded_file', filename=post['image'])}"
-                alt="Фото публикации"
-            >
-            """
-
-        delete_html = ""
-
-        if session.get("user_id") == post["user_id"]:
-            delete_html = f"""
-            <form
-                method="post"
-                action="/post/{post['id']}/delete"
-                style="margin-top:15px;"
-                onsubmit="return confirm('Удалить публикацию?');"
-            >
-                <button class="btn btn-red" type="submit">
-                    Удалить
-                </button>
-            </form>
-            """
-
-        posts_html += f"""
-        <article class="card post">
-
-            {image_html}
-
-            <div class="post-body">
-
-                <div class="post-header">
-
-                    <a href="/user/{post['user_id']}">
-                        {avatar_html(post)}
-                    </a>
-
-                    <div>
-
-                        <a href="/user/{post['user_id']}">
-                            <strong>
-                                {post['username']}
-                            </strong>
-                        </a>
-
-                        <br>
-
-                        <span class="badge">
-                            {type_name}
-                        </span>
-
-                        <div class="muted small">
-                            {post['created_at']}
-                        </div>
-
-                    </div>
-
-                </div>
-
-                <div class="post-text">
-                    {post['text']}
-                </div>
-
-                {delete_html}
-
-            </div>
-
-        </article>
-
-        <br>
-        """
-
-    if not posts_html:
-        posts_html = """
-        <div class="card empty">
-            <h2>Лента пока пустая</h2>
-            <p>
-                Станьте первым, кто создаст публикацию.
-            </p>
-        </div>
-        """
-
-    content = f"""
-    <div class="feed">
-
-        <h1>Лента</h1>
-
+    body = """
+    <div class="hero">
+        <h1>JFGK Studio</h1>
         <p class="muted">
-            Публикации клиентов и специалистов JFGK Studio.
+            Сообщество клиентов и специалистов.
+            Публикуйте работы, находите людей и общайтесь.
         </p>
 
-        {create_form}
+        {% if not user %}
+            <a class="btn" href="{{ url_for('register') }}">
+                Создать аккаунт
+            </a>
+        {% endif %}
+    </div>
 
-        {posts_html}
+    <div class="grid">
+        <section>
+            <div class="card">
+                <h2>Лента публикаций</h2>
+                <p class="muted">
+                    Здесь появляются новые публикации участников.
+                </p>
+            </div>
 
+            {% for post in posts %}
+                <article class="card">
+
+                    <div class="post-header">
+                        {% if post['avatar'] %}
+                            <img
+                                class="avatar"
+                                src="{{ url_for('uploaded_file', filename=post['avatar']) }}"
+                            >
+                        {% else %}
+                            <div class="avatar">
+                                {{ post['display_name'][0]|upper }}
+                            </div>
+                        {% endif %}
+
+                        <div>
+                            <a href="{{ url_for('profile', username=post['username']) }}">
+                                <strong>{{ post['display_name'] }}</strong>
+                            </a>
+
+                            <div class="small muted">
+                                @{{ post['username'] }}
+                                {% if post['account_type'] == 'provider' %}
+                                    · Специалист
+                                {% else %}
+                                    · Клиент
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="post-content">
+                        {{ post['content'] }}
+                    </div>
+
+                    {% if post['image'] %}
+                        <img
+                            class="post-image"
+                            src="{{ url_for('uploaded_file', filename=post['image']) }}"
+                        >
+                    {% endif %}
+
+                    <div class="post-actions">
+
+                        {% if user %}
+                            <form
+                                method="post"
+                                action="{{ url_for('like_post', post_id=post['id']) }}"
+                            >
+                                <button
+                                    class="icon-btn {% if post['liked'] %}liked{% endif %}"
+                                    type="submit"
+                                >
+                                    ♥ {{ post['likes_count'] }}
+                                </button>
+                            </form>
+                        {% else %}
+                            <span class="icon-btn">
+                                ♥ {{ post['likes_count'] }}
+                            </span>
+                        {% endif %}
+
+                        <a
+                            class="icon-btn"
+                            href="{{ url_for('profile', username=post['username']) }}"
+                        >
+                            Профиль
+                        </a>
+                    </div>
+
+                    <div class="small muted" style="margin-top:10px">
+                        {{ post['created_at'] }}
+                    </div>
+
+                </article>
+            {% else %}
+                <div class="card empty">
+                    Пока нет публикаций.
+                    Создайте первую!
+                </div>
+            {% endfor %}
+        </section>
+
+        <aside>
+            <div class="card">
+                <h3>JFGK Studio</h3>
+                <p class="muted">
+                    Найдите специалиста или расскажите о своей работе.
+                </p>
+
+                <a class="btn full" href="{{ url_for('explore') }}">
+                    Найти специалиста
+                </a>
+            </div>
+        </aside>
     </div>
     """
 
-    return page("Лента", content)
+    return page("Лента", render_template_string(body, posts=posts))
 
 
-@app.route("/post/create", methods=["POST"])
-@login_required
-def create_post():
-    text = request.form.get("text", "").strip()
+@app.route("/explore")
+def explore():
+    db = get_db()
 
-    if not text:
-        flash("Публикация не может быть пустой.")
-        return redirect(url_for("feed"))
-
-    image_name = None
-
-    image = request.files.get("image")
-
-    if image and image.filename:
-
-        if not allowed_file(image.filename):
-            flash("Можно загружать только изображения.")
-            return redirect(url_for("feed"))
-
-        original_name = secure_filename(image.filename)
-
-        image_name = (
-            f"{session['user_id']}_"
-            f"{secrets.token_hex(10)}_"
-            f"{original_name}"
-        )
-
-        image.save(
-            os.path.join(
-                app.config["UPLOAD_FOLDER"],
-                image_name,
-            )
-        )
-
-    conn = get_db()
-
-    conn.execute(
+    providers = db.execute(
         """
-        INSERT INTO posts (user_id, text, image)
-        VALUES (?, ?, ?)
-        """,
-        (
-            session["user_id"],
-            text,
-            image_name,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-    flash("Публикация опубликована.")
-
-    return redirect(url_for("feed"))
-
-
-@app.route("/post/<int:post_id>/delete", methods=["POST"])
-@login_required
-def delete_post(post_id):
-    conn = get_db()
-
-    post = conn.execute(
+        SELECT
+            users.*,
+            (
+                SELECT COUNT(*)
+                FROM follows
+                WHERE follows.provider_id = users.id
+            ) AS followers
+        FROM users
+        WHERE users.account_type = 'provider'
+        ORDER BY followers DESC, users.id DESC
         """
-        SELECT *
-        FROM posts
-        WHERE id = ?
-        """,
-        (post_id,),
-    ).fetchone()
+    ).fetchall()
 
-    if not post:
-        conn.close()
-        abort(404)
+    db.close()
 
-    if post["user_id"] != session["user_id"]:
-        conn.close()
-        abort(403)
+    body = """
+    <div class="card">
+        <h1>Специалисты</h1>
+        <p class="muted">
+            Люди, которые предлагают услуги в JFGK Studio.
+        </p>
+    </div>
 
-    if post["image"]:
-        image_path = os.path.join(
-            app.config["UPLOAD_FOLDER"],
-            post["image"],
-        )
+    {% for person in providers %}
+        <div class="card">
+            <div class="user-row">
 
-        if os.path.exists(image_path):
-            try:
-                os.remove(image_path)
-            except OSError:
-                pass
+                {% if person['avatar'] %}
+                    <img
+                        class="avatar"
+                        src="{{ url_for('uploaded_file', filename=person['avatar']) }}"
+                    >
+                {% else %}
+                    <div class="avatar">
+                        {{ person['display_name'][0]|upper }}
+                    </div>
+                {% endif %}
 
-    conn.execute(
-        "DELETE FROM posts WHERE id = ?",
-        (post_id,),
+                <div class="grow">
+                    <a href="{{ url_for('profile', username=person['username']) }}">
+                        <strong>{{ person['display_name'] }}</strong>
+                    </a>
+
+                    <div class="small muted">
+                        @{{ person['username'] }}
+                    </div>
+
+                    {% if person['service_category'] %}
+                        <span class="tag">
+                            {{ person['service_category'] }}
+                        </span>
+                    {% endif %}
+
+                    <div class="small muted" style="margin-top:7px">
+                        {{ person['followers'] }} подписчиков
+                    </div>
+                </div>
+
+                <a
+                    class="btn"
+                    href="{{ url_for('profile', username=person['username']) }}"
+                >
+                    Открыть
+                </a>
+            </div>
+        </div>
+    {% else %}
+        <div class="card empty">
+            Пока нет зарегистрированных специалистов.
+        </div>
+    {% endfor %}
+    """
+
+    return page(
+        "Специалисты",
+        render_template_string(body, providers=providers)
     )
-
-    conn.commit()
-    conn.close()
-
-    flash("Публикация удалена.")
-
-    return redirect(url_for("feed"))
 
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
+    if current_user():
+        return redirect(url_for("feed"))
+
     if request.method == "POST":
-
-        username = request.form.get(
-            "username",
-            "",
+        username = request.form.get("username", "").strip().lower()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        display_name = request.form.get("display_name", "").strip()
+        account_type = request.form.get("account_type", "client")
+        service_category = request.form.get(
+            "service_category",
+            ""
         ).strip()
 
-        email = request.form.get(
-            "email",
-            "",
-        ).strip()
+        if not username or not email or not password or not display_name:
+            flash("Заполните все обязательные поля.", "error")
+            return redirect(url_for("register"))
 
-        password = request.form.get(
-            "password",
-            "",
-        )
+        if len(username) < 3:
+            flash("Имя пользователя должно быть не короче 3 символов.", "error")
+            return redirect(url_for("register"))
 
-        account_type = request.form.get(
-            "account_type",
-            "client",
-        )
+        if len(password) < 6:
+            flash("Пароль должен быть не короче 6 символов.", "error")
+            return redirect(url_for("register"))
 
         if account_type not in {"client", "provider"}:
             account_type = "client"
 
-        if len(username) < 3:
-            flash("Имя пользователя должно содержать минимум 3 символа.")
-            return redirect(url_for("register"))
+        if account_type != "provider":
+            service_category = ""
 
-        if len(password) < 6:
-            flash("Пароль должен содержать минимум 6 символов.")
-            return redirect(url_for("register"))
+        db = get_db()
 
-        conn = get_db()
-
-        exists = conn.execute(
-            """
-            SELECT id
-            FROM users
-            WHERE username = ?
-            """,
-            (username,),
-        ).fetchone()
-
-        if exists:
-            conn.close()
-
-            flash("Такой пользователь уже существует.")
-
-            return redirect(url_for("register"))
-
-        password_hash = generate_password_hash(password)
-
-        conn.execute(
-            """
-            INSERT INTO users
-            (
-                username,
-                password,
-                email,
-                account_type
+        try:
+            cursor = db.execute(
+                """
+                INSERT INTO users
+                (
+                    username,
+                    email,
+                    password,
+                    account_type,
+                    display_name,
+                    service_category,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    username,
+                    email,
+                    generate_password_hash(password),
+                    account_type,
+                    display_name,
+                    service_category,
+                    now(),
+                ),
             )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                username,
-                password_hash,
-                email,
-                account_type,
-            ),
-        )
 
-        conn.commit()
-        conn.close()
+            db.commit()
+            user_id = cursor.lastrowid
 
-        flash("Аккаунт создан. Теперь войдите.")
+        except sqlite3.IntegrityError:
+            db.close()
+            flash(
+                "Такое имя пользователя или email уже используется.",
+                "error"
+            )
+            return redirect(url_for("register"))
 
-        return redirect(url_for("login"))
+        db.close()
 
-    content = """
-    <div class="card" style="max-width:650px;margin:auto;">
+        session["user_id"] = user_id
 
+        flash("Аккаунт создан!", "success")
+
+        return redirect(url_for("feed"))
+
+    body = """
+    <div class="card" style="max-width:650px;margin:auto">
         <h1>Создание аккаунта</h1>
 
         <p class="muted">
-            Выберите тип аккаунта.
+            Выберите, кто вы в JFGK Studio.
         </p>
 
         <form method="post">
 
-            <label>Тип аккаунта</label>
+            <label>
+                Отображаемое имя
+                <input
+                    name="display_name"
+                    placeholder="Например, Илья"
+                    required
+                >
+            </label>
 
-            <select name="account_type" required>
+            <label>
+                Имя пользователя
+                <input
+                    name="username"
+                    placeholder="ilya"
+                    required
+                >
+            </label>
 
-                <option value="client">
-                    Клиент
-                </option>
+            <label>
+                Email
+                <input
+                    type="email"
+                    name="email"
+                    placeholder="you@example.com"
+                    required
+                >
+            </label>
 
-                <option value="provider">
-                    Предоставляющий услугу
-                </option>
+            <label>
+                Пароль
+                <input
+                    type="password"
+                    name="password"
+                    placeholder="Минимум 6 символов"
+                    required
+                >
+            </label>
 
-            </select>
+            <label>
+                Тип аккаунта
+                <select name="account_type" id="account_type">
+                    <option value="client">
+                        Клиент
+                    </option>
+                    <option value="provider">
+                        Специалист
+                    </option>
+                </select>
+            </label>
 
-            <label>Имя пользователя</label>
+            <div id="serviceBox" style="display:none">
+                <label>
+                    Чем вы занимаетесь?
+                    <input
+                        name="service_category"
+                        placeholder="Дизайн, фотография, ремонт..."
+                    >
+                </label>
+            </div>
 
-            <input
-                name="username"
-                minlength="3"
-                required
-                placeholder="Ваше имя"
-            >
-
-            <label>Email</label>
-
-            <input
-                type="email"
-                name="email"
-                placeholder="example@mail.com"
-            >
-
-            <label>Пароль</label>
-
-            <input
-                type="password"
-                name="password"
-                minlength="6"
-                required
-            >
-
-            <br>
-
-            <button class="btn btn-blue" type="submit">
+            <button class="btn full" type="submit">
                 Создать аккаунт
             </button>
-
         </form>
 
+        <p class="muted" style="margin-top:18px">
+            Уже есть аккаунт?
+            <a href="{{ url_for('login') }}" style="color:#a994ff">
+                Войти
+            </a>
+        </p>
     </div>
+
+    <script>
+        const type = document.getElementById("account_type");
+        const box = document.getElementById("serviceBox");
+
+        function updateServiceBox() {
+            box.style.display =
+                type.value === "provider"
+                    ? "block"
+                    : "none";
+        }
+
+        type.addEventListener("change", updateServiceBox);
+        updateServiceBox();
+    </script>
     """
 
-    return page("Регистрация", content)
+    return page(
+        "Регистрация",
+        render_template_string(body)
+    )
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    if current_user():
+        return redirect(url_for("feed"))
 
     if request.method == "POST":
+        login_value = request.form.get("login", "").strip().lower()
+        password = request.form.get("password", "")
 
-        username = request.form.get(
-            "username",
-            "",
-        ).strip()
+        db = get_db()
 
-        password = request.form.get(
-            "password",
-            "",
-        )
-
-        conn = get_db()
-
-        user = conn.execute(
+        user = db.execute(
             """
             SELECT *
             FROM users
             WHERE username = ?
+               OR email = ?
             """,
-            (username,),
+            (login_value, login_value),
         ).fetchone()
 
-        conn.close()
+        db.close()
 
-        if user and check_password_hash(
+        if not user or not check_password_hash(
             user["password"],
-            password,
+            password
         ):
-            session.clear()
+            flash("Неверный логин или пароль.", "error")
+            return redirect(url_for("login"))
 
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
+        session["user_id"] = user["id"]
 
-            return redirect(url_for("feed"))
+        flash("Вы вошли в аккаунт.", "success")
 
-        flash("Неверное имя пользователя или пароль.")
+        return redirect(url_for("feed"))
 
-    content = """
-    <div class="card" style="max-width:500px;margin:auto;">
-
+    body = """
+    <div class="card" style="max-width:500px;margin:auto">
         <h1>Вход</h1>
 
         <form method="post">
+            <label>
+                Email или имя пользователя
+                <input
+                    name="login"
+                    autocomplete="username"
+                    required
+                >
+            </label>
 
-            <label>Имя пользователя</label>
+            <label>
+                Пароль
+                <input
+                    type="password"
+                    name="password"
+                    autocomplete="current-password"
+                    required
+                >
+            </label>
 
-            <input
-                name="username"
-                required
-            >
-
-            <label>Пароль</label>
-
-            <input
-                type="password"
-                name="password"
-                required
-            >
-
-            <br>
-
-            <button class="btn btn-blue" type="submit">
+            <button class="btn full" type="submit">
                 Войти
             </button>
-
         </form>
 
+        <p class="muted" style="margin-top:18px">
+            Нет аккаунта?
+            <a href="{{ url_for('register') }}" style="color:#a994ff">
+                Зарегистрироваться
+            </a>
+        </p>
     </div>
     """
 
-    return page("Вход", content)
+    return page(
+        "Вход",
+        render_template_string(body)
+    )
 
 
 @app.route("/logout")
 def logout():
     session.clear()
-
-    return redirect(url_for("index"))
-
-
-@app.route("/profile")
-@login_required
-def profile():
-    return redirect(
-        url_for(
-            "user_profile",
-            user_id=session["user_id"],
-        )
-    )
+    return redirect(url_for("feed"))
 
 
-@app.route("/user/<int:user_id>")
-def user_profile(user_id):
+@app.route("/profile/<username>")
+def profile(username):
+    db = get_db()
 
-    conn = get_db()
-
-    user = conn.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE id = ?
-        """,
-        (user_id,),
+    person = db.execute(
+        "SELECT * FROM users WHERE username = ?",
+        (username.lower(),),
     ).fetchone()
 
-    if not user:
-        conn.close()
-        abort(404)
+    if not person:
+        db.close()
+        return "Пользователь не найден", 404
 
-    posts = conn.execute(
+    posts = db.execute(
         """
-        SELECT *
+        SELECT
+            posts.*,
+            (
+                SELECT COUNT(*)
+                FROM likes
+                WHERE likes.post_id = posts.id
+            ) AS likes_count,
+            (
+                SELECT COUNT(*)
+                FROM likes
+                WHERE likes.post_id = posts.id
+                AND likes.user_id = ?
+            ) AS liked
         FROM posts
-        WHERE user_id = ?
-        ORDER BY created_at DESC
+        WHERE posts.user_id = ?
+        ORDER BY posts.id DESC
         """,
-        (user_id,),
+        (
+            session.get("user_id", 0),
+            person["id"],
+        ),
     ).fetchall()
 
-    services_list = conn.execute(
+    followers = db.execute(
         """
-        SELECT *
-        FROM services
-        WHERE user_id = ?
-        ORDER BY created_at DESC
+        SELECT COUNT(*)
+        FROM follows
+        WHERE provider_id = ?
         """,
-        (user_id,),
-    ).fetchall()
+        (person["id"],),
+    ).fetchone()[0]
 
-    conn.close()
+    following = False
 
-    type_name = (
-        "Предоставляющий услугу"
-        if user["account_type"] == "provider"
-        else "Клиент"
+    if session.get("user_id"):
+        following = db.execute(
+            """
+            SELECT 1
+            FROM follows
+            WHERE follower_id = ?
+              AND provider_id = ?
+            """,
+            (
+                session["user_id"],
+                person["id"],
+            ),
+        ).fetchone() is not None
+
+    db.close()
+
+    is_owner = (
+        current_user()
+        and current_user()["id"] == person["id"]
     )
 
-    posts_html = ""
+    body = """
+    <div class="card">
+        <div class="profile-top">
 
-    for post in posts:
+            {% if person['avatar'] %}
+                <img
+                    class="avatar xlarge"
+                    src="{{ url_for('uploaded_file', filename=person['avatar']) }}"
+                >
+            {% else %}
+                <div class="avatar xlarge">
+                    {{ person['display_name'][0]|upper }}
+                </div>
+            {% endif %}
 
-        image_html = ""
+            <div class="profile-info">
+                <h1 style="margin-bottom:4px">
+                    {{ person['display_name'] }}
+                </h1>
 
-        if post["image"]:
-            image_html = f"""
-            <img
-                class="post-image"
-                src="{url_for('uploaded_file', filename=post['image'])}"
-            >
-            """
+                <div class="muted">
+                    @{{ person['username'] }}
+                </div>
 
-        posts_html += f"""
-        <article class="card post">
+                {% if person['account_type'] == 'provider' %}
+                    <span class="tag" style="margin-top:10px">
+                        Специалист
+                    </span>
 
-            {image_html}
+                    {% if person['service_category'] %}
+                        <span class="tag" style="margin-top:10px">
+                            {{ person['service_category'] }}
+                        </span>
+                    {% endif %}
+                {% else %}
+                    <span class="tag" style="margin-top:10px">
+                        Клиент
+                    </span>
+                {% endif %}
 
-            <div class="post-body">
-                <div class="post-text">
-                    {post['text']}
+                {% if person['bio'] %}
+                    <p style="line-height:1.6">
+                        {{ person['bio'] }}
+                    </p>
+                {% endif %}
+
+                <div class="stats">
+                    <div class="stat">
+                        <strong>{{ posts|length }}</strong>
+                        <span class="small muted">публикаций</span>
+                    </div>
+
+                    {% if person['account_type'] == 'provider' %}
+                        <div class="stat">
+                            <strong>{{ followers }}</strong>
+                            <span class="small muted">подписчиков</span>
+                        </div>
+                    {% endif %}
+                </div>
+
+                <div class="profile-actions">
+
+                    {% if is_owner %}
+                        <a
+                            class="btn"
+                            href="{{ url_for('edit_profile') }}"
+                        >
+                            Редактировать профиль
+                        </a>
+                    {% else %}
+
+                        {% if user %}
+                            <form
+                                method="post"
+                                action="{{ url_for('follow', user_id=person['id']) }}"
+                            >
+                                {% if person['account_type'] == 'provider' %}
+                                    <button
+                                        class="btn {% if following %}secondary{% endif %}"
+                                        type="submit"
+                                    >
+                                        {% if following %}
+                                            Отписаться
+                                        {% else %}
+                                            Подписаться
+                                        {% endif %}
+                                    </button>
+                                {% endif %}
+                            </form>
+
+                            <a
+                                class="btn secondary"
+                                href="{{ url_for('chat', user_id=person['id']) }}"
+                            >
+                                Написать
+                            </a>
+
+                            {% if person['account_type'] == 'provider' %}
+                                <a
+                                    class="btn green"
+                                    href="{{ url_for('donate', user_id=person['id']) }}"
+                                >
+                                    ♥ Донат
+                                </a>
+                            {% endif %}
+
+                        {% else %}
+                            <a
+                                class="btn"
+                                href="{{ url_for('login') }}"
+                            >
+                                Войти, чтобы написать
+                            </a>
+                        {% endif %}
+
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Публикации</h2>
+    </div>
+
+    {% for post in posts %}
+        <article class="card">
+
+            <div class="post-header">
+                {% if person['avatar'] %}
+                    <img
+                        class="avatar"
+                        src="{{ url_for('uploaded_file', filename=person['avatar']) }}"
+                    >
+                {% else %}
+                    <div class="avatar">
+                        {{ person['display_name'][0]|upper }}
+                    </div>
+                {% endif %}
+
+                <div>
+                    <strong>{{ person['display_name'] }}</strong>
+                    <div class="small muted">
+                        {{ post['created_at'] }}
+                    </div>
                 </div>
             </div>
 
-        </article>
-
-        <br>
-        """
-
-    if not posts_html:
-        posts_html = """
-        <div class="card empty">
-            Публикаций пока нет.
-        </div>
-        """
-
-    services_html = ""
-
-    for service in services_list:
-
-        services_html += f"""
-        <div class="card">
-
-            <h2>
-                {service['title']}
-            </h2>
-
-            <p class="muted">
-                {service['description'] or ''}
-            </p>
-
-            <div class="service-price">
-                {service['price'] or 'Цена по договорённости'}
+            <div class="post-content">
+                {{ post['content'] }}
             </div>
 
-            {
-                f'''
-                <a
-                    class="btn btn-blue"
-                    href="/order/{service["id"]}"
+            {% if post['image'] %}
+                <img
+                    class="post-image"
+                    src="{{ url_for('uploaded_file', filename=post['image']) }}"
                 >
-                    Заказать услугу
-                </a>
-                '''
-                if session.get("user_id")
-                and current_user()
-                and current_user()["account_type"] == "client"
-                and user["account_type"] == "provider"
-                else ""
-            }
+            {% endif %}
 
-        </div>
-        """
-
-    if user["account_type"] == "provider":
-        services_section = f"""
-        <h2>Услуги</h2>
-
-        {services_html or '''
-        <div class="card empty">
-            У этого специалиста пока нет услуг.
-        </div>
-        '''}
-        """
-    else:
-        services_section = ""
-
-    message_button = ""
-
-    if (
-        session.get("user_id")
-        and session["user_id"] != user_id
-    ):
-        message_button = f"""
-        <a
-            class="btn btn-blue"
-            href="/messages/{user_id}"
-        >
-            Написать сообщение
-        </a>
-        """
-
-    content = f"""
-    <div class="card">
-
-        <div class="profile-top">
-
-            {avatar_html(user, large=True)}
-
-            <div>
-
-                <h1>
-                    {user['username']}
-                </h1>
-
-                <span class="badge">
-                    {type_name}
-                </span>
-
-                <p class="muted">
-                    {user['bio'] or 'Пользователь пока не добавил описание.'}
-                </p>
-
-                {message_button}
-
+            <div class="post-actions">
+                {% if user %}
+                    <form
+                        method="post"
+                        action="{{ url_for('like_post', post_id=post['id']) }}"
+                    >
+                        <button
+                            class="icon-btn {% if post['liked'] %}liked{% endif %}"
+                        >
+                            ♥ {{ post['likes_count'] }}
+                        </button>
+                    </form>
+                {% else %}
+                    <span class="icon-btn">
+                        ♥ {{ post['likes_count'] }}
+                    </span>
+                {% endif %}
             </div>
-
+        </article>
+    {% else %}
+        <div class="card empty">
+            У пользователя пока нет публикаций.
         </div>
-
-    </div>
-
-    {services_section}
-
-    <h2>Публикации</h2>
-
-    {posts_html}
+    {% endfor %}
     """
 
     return page(
-        f"Профиль {user['username']}",
-        content,
+        person["display_name"],
+        render_template_string(
+            body,
+            person=person,
+            posts=posts,
+            followers=followers,
+            following=following,
+            is_owner=is_owner,
+        ),
     )
 
 
 @app.route("/profile/edit", methods=["GET", "POST"])
 @login_required
 def edit_profile():
-
-    conn = get_db()
-
-    user = conn.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE id = ?
-        """,
-        (session["user_id"],),
-    ).fetchone()
+    user = current_user()
 
     if request.method == "POST":
-
-        email = request.form.get(
-            "email",
-            "",
+        display_name = request.form.get(
+            "display_name",
+            ""
         ).strip()
 
         bio = request.form.get(
             "bio",
-            "",
+            ""
         ).strip()
 
-        avatar_name = user["avatar"]
+        service_category = request.form.get(
+            "service_category",
+            ""
+        ).strip()
 
         avatar = request.files.get("avatar")
 
+        if not display_name:
+            flash("Введите отображаемое имя.", "error")
+            return redirect(url_for("edit_profile"))
+
+        new_avatar = user["avatar"]
+
         if avatar and avatar.filename:
+            saved = save_image(avatar)
 
-            if not allowed_file(avatar.filename):
-                flash("Неверный формат изображения.")
-
-                conn.close()
-
-                return redirect(
-                    url_for("edit_profile")
+            if not saved:
+                flash(
+                    "Не удалось загрузить аватар. "
+                    "Используйте JPG, PNG, GIF или WEBP.",
+                    "error",
                 )
+                return redirect(url_for("edit_profile"))
 
-            filename = secure_filename(
-                avatar.filename
-            )
+            new_avatar = saved
 
-            avatar_name = (
-                f"{session['user_id']}_"
-                f"{secrets.token_hex(10)}_"
-                f"{filename}"
-            )
+        if user["account_type"] != "provider":
+            service_category = ""
 
-            avatar.save(
-                os.path.join(
-                    app.config["UPLOAD_FOLDER"],
-                    avatar_name,
-                )
-            )
+        db = get_db()
 
-        conn.execute(
+        db.execute(
             """
             UPDATE users
-            SET email = ?,
+            SET
+                display_name = ?,
                 bio = ?,
-                avatar = ?
+                avatar = ?,
+                service_category = ?
             WHERE id = ?
             """,
             (
-                email,
+                display_name,
                 bio,
-                avatar_name,
-                session["user_id"],
+                new_avatar,
+                service_category,
+                user["id"],
             ),
         )
 
-        conn.commit()
-        conn.close()
+        db.commit()
+        db.close()
 
-        flash("Профиль обновлён.")
+        flash("Профиль обновлён.", "success")
 
-        return redirect(url_for("profile"))
+        return redirect(
+            url_for(
+                "profile",
+                username=user["username"],
+            )
+        )
 
-    conn.close()
-
-    content = f"""
-    <div class="card" style="max-width:650px;margin:auto;">
-
-        <h1>Редактирование профиля</h1>
+    body = """
+    <div class="card" style="max-width:700px;margin:auto">
+        <h1>Редактировать профиль</h1>
 
         <form
             method="post"
             enctype="multipart/form-data"
         >
 
-            <label>Email</label>
-
-            <input
-                type="email"
-                name="email"
-                value="{user['email'] or ''}"
-            >
-
-            <label>О себе</label>
-
-            <textarea name="bio">{user['bio'] or ''}</textarea>
-
-            <label>Аватар</label>
-
-            <input
-                type="file"
-                name="avatar"
-                accept="image/*"
-            >
-
-            <br>
-
-            <button class="btn btn-blue" type="submit">
-                Сохранить
-            </button>
-
-        </form>
-
-    </div>
-    """
-
-    return page("Редактирование профиля", content)
-
-
-@app.route("/services")
-def services():
-
-    conn = get_db()
-
-    services_list = conn.execute(
-        """
-        SELECT
-            services.*,
-            users.username,
-            users.avatar
-        FROM services
-        JOIN users
-            ON users.id = services.user_id
-        ORDER BY services.created_at DESC
-        """
-    ).fetchall()
-
-    conn.close()
-
-    services_html = ""
-
-    for service in services_list:
-
-        services_html += f"""
-        <div class="card">
-
-            <div class="user-row">
-
-                <a href="/user/{service['user_id']}">
-                    {avatar_html(service)}
-                </a>
-
-                <div>
-                    <a href="/user/{service['user_id']}">
-                        <strong>
-                            {service['username']}
-                        </strong>
-                    </a>
-
-                    <br>
-
-                    <span class="badge">
-                        Специалист
-                    </span>
-                </div>
-
-            </div>
-
-            <h2>
-                {service['title']}
-            </h2>
-
-            <p class="muted">
-                {service['description'] or ''}
-            </p>
-
-            <div class="service-price">
-                {service['price'] or 'Цена по договорённости'}
-            </div>
-
-            {
-                f'''
-                <a
-                    class="btn btn-blue"
-                    href="/order/{service["id"]}"
-                >
-                    Заказать
-                </a>
-                '''
-                if session.get("user_id")
-                and current_user()
-                and current_user()["account_type"] == "client"
-                else ""
-            }
-
-        </div>
-        """
-
-    if not services_html:
-        services_html = """
-        <div class="card empty">
-            Пока никто не добавил услугу.
-        </div>
-        """
-
-    add_service = ""
-
-    user = current_user()
-
-    if user and user["account_type"] == "provider":
-        add_service = """
-        <a
-            class="btn btn-blue"
-            href="/service/create"
-        >
-            Добавить услугу
-        </a>
-        """
-
-    content = f"""
-    <div style="
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        gap:15px;
-        flex-wrap:wrap;
-    ">
-
-        <div>
-            <h1>Услуги</h1>
-
-            <p class="muted">
-                Найдите специалиста для своей задачи.
-            </p>
-        </div>
-
-        {add_service}
-
-    </div>
-
-    <br>
-
-    <div class="grid">
-        {services_html}
-    </div>
-    """
-
-    return page("Услуги", content)
-
-
-@app.route("/service/create", methods=["GET", "POST"])
-@provider_required
-def create_service():
-
-    if request.method == "POST":
-
-        title = request.form.get(
-            "title",
-            "",
-        ).strip()
-
-        description = request.form.get(
-            "description",
-            "",
-        ).strip()
-
-        price = request.form.get(
-            "price",
-            "",
-        ).strip()
-
-        if not title:
-            flash("Название услуги обязательно.")
-
-            return redirect(
-                url_for("create_service")
-            )
-
-        conn = get_db()
-
-        conn.execute(
-            """
-            INSERT INTO services
-            (
-                user_id,
-                title,
-                description,
-                price
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                session["user_id"],
-                title,
-                description,
-                price,
-            ),
-        )
-
-        conn.commit()
-        conn.close()
-
-        flash("Услуга добавлена.")
-
-        return redirect(
-            url_for("services")
-        )
-
-    content = """
-    <div class="card" style="max-width:700px;margin:auto;">
-
-        <h1>Добавить услугу</h1>
-
-        <form method="post">
-
-            <label>Название услуги</label>
-
-            <input
-                name="title"
-                placeholder="Например: Создание сайта"
-                required
-            >
-
-            <label>Описание</label>
-
-            <textarea
-                name="description"
-                placeholder="Расскажите, что входит в услугу"
-            ></textarea>
-
-            <label>Цена</label>
-
-            <input
-                name="price"
-                placeholder="Например: от 10 000 ₽"
-            >
-
-            <br>
-
-            <button class="btn btn-blue" type="submit">
-                Добавить услугу
-            </button>
-
-        </form>
-
-    </div>
-    """
-
-    return page(
-        "Добавить услугу",
-        content,
-    )
-
-
-@app.route("/order/<int:service_id>", methods=["GET", "POST"])
-@client_required
-def create_order(service_id):
-
-    conn = get_db()
-
-    service = conn.execute(
-        """
-        SELECT
-            services.*,
-            users.username
-        FROM services
-        JOIN users
-            ON users.id = services.user_id
-        WHERE services.id = ?
-        """,
-        (service_id,),
-    ).fetchone()
-
-    if not service:
-        conn.close()
-        abort(404)
-
-    if request.method == "POST":
-
-        description = request.form.get(
-            "description",
-            "",
-        ).strip()
-
-        conn.execute(
-            """
-            INSERT INTO orders
-            (
-                client_id,
-                provider_id,
-                service_id,
-                description
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                session["user_id"],
-                service["user_id"],
-                service_id,
-                description,
-            ),
-        )
-
-        conn.commit()
-        conn.close()
-
-        flash("Заявка отправлена специалисту.")
-
-        return redirect(
-            url_for("orders")
-        )
-
-    conn.close()
-
-    content = f"""
-    <div class="card" style="max-width:700px;margin:auto;">
-
-        <h1>
-            Заказать: {service['title']}
-        </h1>
-
-        <p class="muted">
-            Специалист: {service['username']}
-        </p>
-
-        <p>
-            {service['description'] or ''}
-        </p>
-
-        <strong>
-            {service['price'] or 'Цена по договорённости'}
-        </strong>
-
-        <br><br>
-
-        <form method="post">
-
             <label>
-                Что нужно сделать?
+                Отображаемое имя
+                <input
+                    name="display_name"
+                    value="{{ user['display_name'] }}"
+                    required
+                >
             </label>
 
-            <textarea
-                name="description"
-                placeholder="Опишите вашу задачу"
-                required
-            ></textarea>
+            <label>
+                О себе
+                <textarea
+                    name="bio"
+                    placeholder="Расскажите о себе..."
+                >{{ user['bio'] }}</textarea>
+            </label>
 
-            <button
-                class="btn btn-blue"
-                type="submit"
-            >
-                Отправить заявку
+            {% if user['account_type'] == 'provider' %}
+                <label>
+                    Услуга / специализация
+                    <input
+                        name="service_category"
+                        value="{{ user['service_category'] }}"
+                        placeholder="Например: фотограф"
+                    >
+                </label>
+            {% endif %}
+
+            <label>
+                Аватар
+                <input
+                    type="file"
+                    name="avatar"
+                    accept="image/*"
+                >
+            </label>
+
+            <button class="btn full" type="submit">
+                Сохранить изменения
             </button>
-
         </form>
-
     </div>
     """
 
     return page(
-        "Заказ услуги",
-        content,
+        "Редактирование профиля",
+        render_template_string(body, user=user),
     )
 
 
-@app.route("/orders")
+@app.route("/post/new", methods=["GET", "POST"])
 @login_required
-def orders():
-
+def new_post():
     user = current_user()
 
-    conn = get_db()
+    if request.method == "POST":
+        content = request.form.get(
+            "content",
+            ""
+        ).strip()
 
-    if user["account_type"] == "client":
+        image = request.files.get("image")
 
-        orders_list = conn.execute(
+        if not content:
+            flash("Напишите что-нибудь.", "error")
+            return redirect(url_for("new_post"))
+
+        image_name = ""
+
+        if image and image.filename:
+            image_name = save_image(image)
+
+            if not image_name:
+                flash(
+                    "Неподдерживаемый формат изображения.",
+                    "error",
+                )
+                return redirect(url_for("new_post"))
+
+        db = get_db()
+
+        db.execute(
             """
-            SELECT
-                orders.*,
-                services.title,
-                users.username AS provider_name
-            FROM orders
-            JOIN services
-                ON services.id = orders.service_id
-            JOIN users
-                ON users.id = orders.provider_id
-            WHERE orders.client_id = ?
-            ORDER BY orders.created_at DESC
+            INSERT INTO posts
+            (
+                user_id,
+                content,
+                image,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
             """,
-            (session["user_id"],),
-        ).fetchall()
-
-        title = "Мои заявки"
-
-        items_html = ""
-
-        for order in orders_list:
-
-            items_html += f"""
-            <div class="card">
-
-                <h2>
-                    {order['title']}
-                </h2>
-
-                <p>
-                    Специалист:
-                    <strong>
-                        {order['provider_name']}
-                    </strong>
-                </p>
-
-                <p class="muted">
-                    {order['description'] or ''}
-                </p>
-
-                <span class="badge">
-                    {order['status']}
-                </span>
-
-            </div>
-
-            <br>
-            """
-
-    else:
-
-        orders_list = conn.execute(
-            """
-            SELECT
-                orders.*,
-                services.title,
-                users.username AS client_name
-            FROM orders
-            JOIN services
-                ON services.id = orders.service_id
-            JOIN users
-                ON users.id = orders.client_id
-            WHERE orders.provider_id = ?
-            ORDER BY orders.created_at DESC
-            """,
-            (session["user_id"],),
-        ).fetchall()
-
-        title = "Заявки клиентов"
-
-        items_html = ""
-
-        for order in orders_list:
-
-            items_html += f"""
-            <div class="card">
-
-                <h2>
-                    {order['title']}
-                </h2>
-
-                <p>
-                    Клиент:
-                    <strong>
-                        {order['client_name']}
-                    </strong>
-                </p>
-
-                <p class="muted">
-                    {order['description'] or ''}
-                </p>
-
-                <span class="badge">
-                    {order['status']}
-                </span>
-
-            </div>
-
-            <br>
-            """
-
-    conn.close()
-
-    if not items_html:
-        items_html = """
-        <div class="card empty">
-            Заявок пока нет.
-        </div>
-        """
-
-    content = f"""
-    <h1>{title}</h1>
-
-    {items_html}
-    """
-
-    return page(
-        title,
-        content,
-    )
-
-
-@app.route("/messages")
-@login_required
-def messages():
-
-    conn = get_db()
-
-    users = conn.execute(
-        """
-        SELECT
-            id,
-            username,
-            account_type,
-            avatar
-        FROM users
-        WHERE id != ?
-        ORDER BY username
-        """,
-        (session["user_id"],),
-    ).fetchall()
-
-    conn.close()
-
-    users_html = ""
-
-    for user in users:
-
-        type_name = (
-            "Специалист"
-            if user["account_type"] == "provider"
-            else "Клиент"
+            (
+                user["id"],
+                content,
+                image_name,
+                now(),
+            ),
         )
 
-        users_html += f"""
-        <div class="card">
+        db.commit()
+        db.close()
 
-            <div class="user-row">
+        flash("Публикация опубликована.", "success")
 
-                {avatar_html(user)}
+        return redirect(url_for("feed"))
 
-                <div>
+    body = """
+    <div class="card" style="max-width:700px;margin:auto">
+        <h1>Новая публикация</h1>
 
-                    <a href="/user/{user['id']}">
-                        <strong>
-                            {user['username']}
-                        </strong>
-                    </a>
+        <form
+            method="post"
+            enctype="multipart/form-data"
+        >
+            <label>
+                Текст публикации
+                <textarea
+                    name="content"
+                    placeholder="Что хотите рассказать?"
+                    required
+                ></textarea>
+            </label>
 
-                    <br>
+            <label>
+                Фотография
+                <input
+                    type="file"
+                    name="image"
+                    accept="image/*"
+                >
+            </label>
 
-                    <span class="badge">
-                        {type_name}
-                    </span>
-
-                </div>
-
-            </div>
-
-            <br>
-
-            <a
-                class="btn btn-blue"
-                href="/messages/{user['id']}"
-            >
-                Написать
-            </a>
-
-        </div>
-        """
-
-    if not users_html:
-        users_html = """
-        <div class="card empty">
-            Пока нет других пользователей.
-        </div>
-        """
-
-    content = f"""
-    <h1>Сообщения</h1>
-
-    <div class="grid">
-        {users_html}
+            <button class="btn full" type="submit">
+                Опубликовать
+            </button>
+        </form>
     </div>
     """
 
     return page(
-        "Сообщения",
-        content,
+        "Новая публикация",
+        render_template_string(body),
     )
 
 
-@app.route("/messages/<int:user_id>", methods=["GET", "POST"])
+@app.route("/post/<int:post_id>/like", methods=["POST"])
 @login_required
-def chat(user_id):
+def like_post(post_id):
+    user = current_user()
 
-    if user_id == session["user_id"]:
-        return redirect(url_for("messages"))
+    db = get_db()
 
-    conn = get_db()
+    post = db.execute(
+        "SELECT id FROM posts WHERE id = ?",
+        (post_id,),
+    ).fetchone()
 
-    other_user = conn.execute(
+    if not post:
+        db.close()
+        return redirect(url_for("feed"))
+
+    existing = db.execute(
         """
-        SELECT *
-        FROM users
-        WHERE id = ?
+        SELECT id
+        FROM likes
+        WHERE user_id = ?
+          AND post_id = ?
         """,
+        (
+            user["id"],
+            post_id,
+        ),
+    ).fetchone()
+
+    if existing:
+        db.execute(
+            "DELETE FROM likes WHERE id = ?",
+            (existing["id"],),
+        )
+    else:
+        db.execute(
+            """
+            INSERT INTO likes
+            (
+                user_id,
+                post_id
+            )
+            VALUES (?, ?)
+            """,
+            (
+                user["id"],
+                post_id,
+            ),
+        )
+
+    db.commit()
+    db.close()
+
+    return request.referrer or redirect(url_for("feed"))
+
+
+@app.route("/user/<int:user_id>/follow", methods=["POST"])
+@login_required
+def follow(user_id):
+    user = current_user()
+
+    if user["id"] == user_id:
+        flash("Нельзя подписаться на самого себя.", "error")
+        return redirect(request.referrer or url_for("feed"))
+
+    db = get_db()
+
+    target = db.execute(
+        "SELECT * FROM users WHERE id = ?",
         (user_id,),
     ).fetchone()
 
-    if not other_user:
-        conn.close()
-        abort(404)
+    if not target:
+        db.close()
+        return redirect(url_for("feed"))
+
+    if target["account_type"] != "provider":
+        db.close()
+        flash(
+            "Подписываться можно только на специалистов.",
+            "error",
+        )
+        return redirect(request.referrer or url_for("feed"))
+
+    existing = db.execute(
+        """
+        SELECT id
+        FROM follows
+        WHERE follower_id = ?
+          AND provider_id = ?
+        """,
+        (
+            user["id"],
+            user_id,
+        ),
+    ).fetchone()
+
+    if existing:
+        db.execute(
+            "DELETE FROM follows WHERE id = ?",
+            (existing["id"],),
+        )
+    else:
+        db.execute(
+            """
+            INSERT INTO follows
+            (
+                follower_id,
+                provider_id
+            )
+            VALUES (?, ?)
+            """,
+            (
+                user["id"],
+                user_id,
+            ),
+        )
+
+    db.commit()
+    db.close()
+
+    return request.referrer or redirect(
+        url_for(
+            "profile",
+            username=target["username"],
+        )
+    )
+
+
+@app.route("/chats")
+@login_required
+def chats():
+    user = current_user()
+
+    db = get_db()
+
+    conversations = db.execute(
+        """
+        SELECT
+            other.id,
+            other.username,
+            other.display_name,
+            other.avatar,
+            other.account_type,
+            MAX(messages.id) AS last_message_id
+        FROM messages
+        JOIN users AS other
+            ON other.id =
+                CASE
+                    WHEN messages.sender_id = ?
+                    THEN messages.receiver_id
+                    ELSE messages.sender_id
+                END
+        WHERE messages.sender_id = ?
+           OR messages.receiver_id = ?
+        GROUP BY other.id
+        ORDER BY last_message_id DESC
+        """,
+        (
+            user["id"],
+            user["id"],
+            user["id"],
+        ),
+    ).fetchall()
+
+    db.close()
+
+    body = """
+    <div class="card">
+        <h1>Чаты</h1>
+        <p class="muted">
+            Ваши личные разговоры с участниками JFGK Studio.
+        </p>
+    </div>
+
+    <div class="card">
+        <div class="chat-list">
+
+            {% for person in conversations %}
+                <a
+                    class="chat-item"
+                    href="{{ url_for('chat', user_id=person['id']) }}"
+                >
+
+                    {% if person['avatar'] %}
+                        <img
+                            class="avatar"
+                            src="{{ url_for('uploaded_file', filename=person['avatar']) }}"
+                        >
+                    {% else %}
+                        <div class="avatar">
+                            {{ person['display_name'][0]|upper }}
+                        </div>
+                    {% endif %}
+
+                    <div>
+                        <strong>{{ person['display_name'] }}</strong>
+
+                        <div class="small muted">
+                            @{{ person['username'] }}
+                        </div>
+                    </div>
+
+                </a>
+            {% else %}
+                <div class="empty">
+                    У вас пока нет чатов.
+                    Откройте профиль пользователя и нажмите
+                    «Написать».
+                </div>
+            {% endfor %}
+
+        </div>
+    </div>
+    """
+
+    return page(
+        "Чаты",
+        render_template_string(
+            body,
+            conversations=conversations,
+        ),
+    )
+
+
+@app.route("/chat/<int:user_id>", methods=["GET", "POST"])
+@login_required
+def chat(user_id):
+    user = current_user()
+
+    if user["id"] == user_id:
+        return redirect(
+            url_for(
+                "profile",
+                username=user["username"],
+            )
+        )
+
+    db = get_db()
+
+    target = db.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+
+    if not target:
+        db.close()
+        return "Пользователь не найден", 404
 
     if request.method == "POST":
-
-        text = request.form.get(
-            "text",
-            "",
+        text_message = request.form.get(
+            "message",
+            ""
         ).strip()
 
-        if text:
-
-            conn.execute(
+        if text_message:
+            db.execute(
                 """
                 INSERT INTO messages
                 (
                     sender_id,
                     receiver_id,
-                    text
+                    text,
+                    created_at
                 )
-                VALUES (?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 """,
                 (
-                    session["user_id"],
+                    user["id"],
                     user_id,
-                    text,
+                    text_message,
+                    now(),
                 ),
             )
 
-            conn.commit()
+            db.commit()
 
-    chat_messages = conn.execute(
+        db.close()
+
+        return redirect(
+            url_for(
+                "chat",
+                user_id=user_id,
+            )
+        )
+
+    messages = db.execute(
         """
         SELECT *
         FROM messages
@@ -2240,141 +2056,363 @@ def chat(user_id):
                 sender_id = ?
                 AND receiver_id = ?
             )
-        ORDER BY created_at ASC
+        ORDER BY id ASC
         """,
         (
-            session["user_id"],
+            user["id"],
             user_id,
             user_id,
-            session["user_id"],
+            user["id"],
         ),
     ).fetchall()
 
-    conn.close()
-
-    messages_html = ""
-
-    for message in chat_messages:
-
-        mine = (
-            message["sender_id"]
-            == session["user_id"]
-        )
-
-        align = "right" if mine else "left"
-
-        messages_html += f"""
-        <div style="
-            text-align:{align};
-            margin:10px 0;
-        ">
-
-            <span style="
-                display:inline-block;
-                background:
-                    {'#657eff' if mine else '#252b36'};
-                padding:11px 15px;
-                border-radius:12px;
-                max-width:80%;
-                text-align:left;
-            ">
-                {message['text']}
-            </span>
-
-        </div>
+    db.execute(
         """
+        UPDATE messages
+        SET is_read = 1
+        WHERE sender_id = ?
+          AND receiver_id = ?
+        """,
+        (
+            user_id,
+            user["id"],
+        ),
+    )
 
-    content = f"""
-    <div class="card" style="max-width:800px;margin:auto;">
+    db.commit()
+    db.close()
 
-        <div class="user-row">
+    body = """
+    <div class="card">
 
-            {avatar_html(other_user)}
+        <div class="post-header">
+
+            {% if target['avatar'] %}
+                <img
+                    class="avatar"
+                    src="{{ url_for('uploaded_file', filename=target['avatar']) }}"
+                >
+            {% else %}
+                <div class="avatar">
+                    {{ target['display_name'][0]|upper }}
+                </div>
+            {% endif %}
 
             <div>
-                <h2>
-                    {other_user['username']}
-                </h2>
+                <a
+                    href="{{ url_for('profile', username=target['username']) }}"
+                >
+                    <strong>{{ target['display_name'] }}</strong>
+                </a>
+
+                <div class="small muted">
+                    @{{ target['username'] }}
+                </div>
             </div>
 
         </div>
 
-        <hr style="
-            border:0;
-            border-top:1px solid #2b313d;
-            margin:20px 0;
-        ">
+        <div class="messages" id="messages">
 
-        {messages_html}
+            {% for message in messages %}
+                <div
+                    class="message
+                    {% if message['sender_id'] == user['id'] %}
+                        mine
+                    {% endif %}"
+                >
+                    {{ message['text'] }}
 
-        <form method="post">
+                    <span class="message-time">
+                        {{ message['created_at'] }}
+                    </span>
+                </div>
+            {% else %}
+                <div class="empty">
+                    Начните общение.
+                </div>
+            {% endfor %}
 
-            <textarea
-                name="text"
-                placeholder="Введите сообщение..."
+        </div>
+
+        <form method="post" style="display:flex;gap:8px">
+            <input
+                name="message"
+                placeholder="Напишите сообщение..."
+                autocomplete="off"
+                style="margin:0"
                 required
-            ></textarea>
-
-            <button
-                class="btn btn-blue"
-                type="submit"
             >
+
+            <button class="btn" type="submit">
                 Отправить
             </button>
-
         </form>
 
     </div>
+
+    <script>
+        const messages = document.getElementById("messages");
+
+        if (messages) {
+            messages.scrollTop = messages.scrollHeight;
+        }
+    </script>
     """
 
     return page(
-        f"Чат — {other_user['username']}",
-        content,
+        f"Чат с {target['display_name']}",
+        render_template_string(
+            body,
+            target=target,
+            messages=messages,
+        ),
     )
 
 
-@app.route("/static/uploads/<path:filename>")
+@app.route("/donate/<int:user_id>", methods=["GET", "POST"])
+@login_required
+def donate(user_id):
+    user = current_user()
+
+    if user["id"] == user_id:
+        return redirect(
+            url_for(
+                "profile",
+                username=user["username"],
+            )
+        )
+
+    db = get_db()
+
+    target = db.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+
+    db.close()
+
+    if not target:
+        return "Пользователь не найден", 404
+
+    if target["account_type"] != "provider":
+        flash(
+            "Донаты доступны специалистам.",
+            "error",
+        )
+        return redirect(
+            url_for(
+                "profile",
+                username=target["username"],
+            )
+        )
+
+    if request.method == "POST":
+        amount = request.form.get("amount", "").strip()
+        message = request.form.get(
+            "message",
+            ""
+        ).strip()
+
+        try:
+            amount_rub = float(amount)
+        except ValueError:
+            amount_rub = 0
+
+        if amount_rub < 10:
+            flash(
+                "Минимальная сумма доната — 10 ₽.",
+                "error",
+            )
+            return redirect(
+                url_for(
+                    "donate",
+                    user_id=user_id,
+                )
+            )
+
+        amount_kopecks = int(amount_rub * 100)
+
+        db = get_db()
+
+        db.execute(
+            """
+            INSERT INTO donations
+            (
+                donor_id,
+                receiver_id,
+                amount,
+                message,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                target["id"],
+                amount_kopecks,
+                message,
+                "pending",
+                now(),
+            ),
+        )
+
+        db.commit()
+        db.close()
+
+        flash(
+            "Заявка на донат создана. "
+            "Для настоящей оплаты подключите платёжную систему.",
+            "success",
+        )
+
+        return redirect(
+            url_for(
+                "profile",
+                username=target["username"],
+            )
+        )
+
+    body = """
+    <div class="card donate-box" style="max-width:650px;margin:auto">
+
+        {% if target['avatar'] %}
+            <img
+                class="avatar large"
+                style="margin:auto"
+                src="{{ url_for('uploaded_file', filename=target['avatar']) }}"
+            >
+        {% else %}
+            <div class="avatar large" style="margin:auto">
+                {{ target['display_name'][0]|upper }}
+            </div>
+        {% endif %}
+
+        <h1 style="margin-top:18px">
+            Поддержать {{ target['display_name'] }}
+        </h1>
+
+        <p class="muted">
+            Оставьте донат специалисту и при желании
+            добавьте сообщение.
+        </p>
+
+        <form method="post">
+
+            <label>
+                Сумма, ₽
+                <input
+                    type="number"
+                    name="amount"
+                    min="10"
+                    step="1"
+                    value="100"
+                    required
+                >
+            </label>
+
+            <div class="amounts">
+                <button
+                    type="button"
+                    onclick="setAmount(100)"
+                >
+                    100 ₽
+                </button>
+
+                <button
+                    type="button"
+                    onclick="setAmount(250)"
+                >
+                    250 ₽
+                </button>
+
+                <button
+                    type="button"
+                    onclick="setAmount(500)"
+                >
+                    500 ₽
+                </button>
+
+                <button
+                    type="button"
+                    onclick="setAmount(1000)"
+                >
+                    1000 ₽
+                </button>
+            </div>
+
+            <label>
+                Сообщение
+                <textarea
+                    name="message"
+                    placeholder="Напишите что-нибудь..."
+                ></textarea>
+            </label>
+
+            <button class="btn green full" type="submit">
+                Поддержать
+            </button>
+        </form>
+
+        <p class="small muted" style="margin-top:15px">
+            Сейчас это демонстрационная система.
+            Для реального приёма платежей необходимо
+            подключить платёжный сервис.
+        </p>
+    </div>
+
+    <script>
+        function setAmount(value) {
+            document.querySelector(
+                'input[name="amount"]'
+            ).value = value;
+        }
+    </script>
+    """
+
+    return page(
+        "Донат",
+        render_template_string(
+            body,
+            target=target,
+        ),
+    )
+
+
+@app.route("/uploads/<filename>")
 def uploaded_file(filename):
-    return __import__("flask").send_from_directory(
+    return send_from_directory(
         app.config["UPLOAD_FOLDER"],
         filename,
     )
 
 
-@app.route("/robots.txt")
-def robots():
-    return """User-agent: *
-Allow: /
-"""
-
-
 @app.errorhandler(413)
-def file_too_large(error):
+def too_large(error):
     return page(
         "Файл слишком большой",
         """
         <div class="card">
             <h1>Файл слишком большой</h1>
-
             <p class="muted">
-                Максимальный размер изображения — 10 МБ.
+                Максимальный размер файла — 10 МБ.
             </p>
-
-            <a class="btn" href="/feed">
-                Вернуться в ленту
+            <a class="btn" href="javascript:history.back()">
+                Назад
             </a>
         </div>
         """,
     ), 413
 
 
+@app.route("/health")
+def health():
+    return "JFGK Studio is running!"
+
+
 if __name__ == "__main__":
-    port = int(
-        os.environ.get(
-            "PORT",
-            "5000",
-        )
-    )
+    port = int(os.environ.get("PORT", 5000))
 
     app.run(
         host="0.0.0.0",
